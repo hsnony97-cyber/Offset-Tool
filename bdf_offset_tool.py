@@ -33,6 +33,47 @@ import pandas as pd
 from pyNastran.bdf.bdf import BDF
 
 
+def _get_thickness(prop, elem=None) -> float | None:
+    """
+    Robustly extract shell thickness from a pyNastran property object.
+    Handles PSHELL (prop.t), PCOMP (total_thickness()), and per-element
+    thickness defined on CQUAD4/CTRIA3 T1..T4 fields.
+    Returns None if thickness cannot be determined.
+    """
+    # PSHELL
+    if hasattr(prop, "t") and prop.t is not None and prop.t != 0.0:
+        return float(prop.t)
+
+    # PCOMP / PCOMPG
+    if hasattr(prop, "total_thickness"):
+        try:
+            t = prop.total_thickness()
+            if t is not None and t > 0:
+                return float(t)
+        except Exception:
+            pass
+    # Also try summing ply thicknesses directly
+    if hasattr(prop, "thicknesses"):
+        try:
+            t = sum(prop.thicknesses)
+            if t > 0:
+                return float(t)
+        except Exception:
+            pass
+
+    # PSHELL where t is not set but element has per-corner thicknesses
+    if elem is not None and hasattr(elem, "T1"):
+        try:
+            vals = [v for v in (elem.T1, elem.T2, elem.T3, getattr(elem, "T4", None))
+                    if v is not None and v > 0]
+            if vals:
+                return float(sum(vals) / len(vals))
+        except Exception:
+            pass
+
+    return None
+
+
 class BDFOffsetTool:
     def __init__(self, root):
         self.root = root
@@ -246,52 +287,98 @@ class BDFOffsetTool:
             # --- Read element IDs from Excel ---
             self._log("\nReading element IDs from Excel…")
             xl = pd.ExcelFile(self.offset_element_excel.get())
-            self._log(f"  Sheets: {', '.join(xl.sheet_names)}")
+            self._log(f"  Sheets found: {', '.join(xl.sheet_names)}")
 
+            # Sheet detection: primary (requires both keywords), then fallback (any match)
             landing_sheet = bar_sheet = None
+            landing_sheet_fb = bar_sheet_fb = None  # fallback candidates
+
             for s in xl.sheet_names:
                 key = s.lower().replace("_", "").replace(" ", "")
                 if "landing" in key and "offset" in key:
                     landing_sheet = s
                 elif "bar" in key and "offset" in key:
                     bar_sheet = s
+                # fallbacks
+                if landing_sheet_fb is None and "landing" in key:
+                    landing_sheet_fb = s
+                if bar_sheet_fb is None and "bar" in key and "landing" not in key:
+                    bar_sheet_fb = s
+
+            if landing_sheet is None and landing_sheet_fb is not None:
+                landing_sheet = landing_sheet_fb
+                self._log(f"  [!] No 'Landing_Offset' sheet — using fallback: '{landing_sheet}'")
+            if bar_sheet is None and bar_sheet_fb is not None:
+                bar_sheet = bar_sheet_fb
+                self._log(f"  [!] No 'Bar_Offset' sheet — using fallback: '{bar_sheet}'")
+
+            if landing_sheet is None:
+                self._log("  [!] WARNING: No landing sheet detected! "
+                          "Sheet must contain 'landing' in its name.")
+            if bar_sheet is None:
+                self._log("  [!] WARNING: No bar sheet detected! "
+                          "Sheet must contain 'bar' in its name.")
 
             landing_ids: list[int] = []
             bar_ids: list[int] = []
 
             if landing_sheet:
-                self._log(f"\n  Reading '{landing_sheet}'…")
+                self._log(f"\n  Reading landing sheet: '{landing_sheet}'…")
                 df = pd.read_excel(xl, sheet_name=landing_sheet)
                 landing_ids = df.iloc[:, 0].dropna().astype(int).tolist()
-                self._log(f"    {len(landing_ids)} landing element IDs found")
+                self._log(f"    {len(landing_ids)} landing element IDs read from Excel")
+                if landing_ids:
+                    sample = landing_ids[:5]
+                    self._log(f"    First IDs: {sample}")
 
             if bar_sheet:
-                self._log(f"\n  Reading '{bar_sheet}'…")
+                self._log(f"\n  Reading bar sheet: '{bar_sheet}'…")
                 df = pd.read_excel(xl, sheet_name=bar_sheet)
                 bar_ids = df.iloc[:, 0].dropna().astype(int).tolist()
-                self._log(f"    {len(bar_ids)} bar element IDs found")
+                self._log(f"    {len(bar_ids)} bar element IDs read from Excel")
+                if bar_ids:
+                    sample = bar_ids[:5]
+                    self._log(f"    First IDs: {sample}")
 
             # --- Read BDF ---
             self._log(f"\n{sep}")
             self._log("Reading BDF with pyNastran…")
-            bdf = BDF(debug=False)
             bdf_path = self.offset_input_bdf.get()
+
+            def _try_read(punch: bool) -> BDF:
+                b = BDF(debug=False)
+                b.read_bdf(
+                    bdf_path, validate=False, xref=False,
+                    read_includes=True, encoding="latin-1",
+                    punch=punch,
+                )
+                return b
+
+            bdf = BDF(debug=False)
             try:
-                bdf.read_bdf(
-                    bdf_path, validate=False, xref=False,
-                    read_includes=True, encoding="latin-1"
-                )
-            except Exception:
-                self._log("  Standard read failed — retrying with punch=True…")
-                bdf = BDF(debug=False)
-                bdf.read_bdf(
-                    bdf_path, validate=False, xref=False,
-                    read_includes=True, encoding="latin-1", punch=True
-                )
+                bdf = _try_read(punch=False)
+                self._log("  BDF read OK (standard mode)")
+            except Exception as e:
+                self._log(f"  Standard read raised: {e}")
+                # Keep whatever was partially read; if empty, retry with punch=True
+                if len(bdf.elements) == 0:
+                    self._log("  Retrying with punch=True (skips EXEC/CASE CONTROL)…")
+                    try:
+                        bdf = _try_read(punch=True)
+                        self._log("  BDF read OK (punch mode)")
+                    except Exception as e2:
+                        self._log(f"  punch=True also raised: {e2} — using partial data")
 
             self._log(f"  Nodes:      {len(bdf.nodes)}")
             self._log(f"  Elements:   {len(bdf.elements)}")
             self._log(f"  Properties: {len(bdf.properties)}")
+
+            # Sanity-check: show element types present in BDF
+            from collections import Counter
+            type_counts = Counter(e.type for e in bdf.elements.values())
+            self._log(f"  Element types: " +
+                      ", ".join(f"{t}={n}" for t, n in
+                                sorted(type_counts.items(), key=lambda x: -x[1])[:8]))
 
             # --- Landing offsets ---
             self._log(f"\n{sep}")
@@ -301,23 +388,42 @@ class BDFOffsetTool:
             landing_thickness: dict[int, float] = {}
             landing_normals: dict[int, np.ndarray] = {}
 
+            # Diagnostic counters
+            dbg_not_in_bdf = 0
+            dbg_no_pid = 0
+            dbg_pid_not_in_props = 0
+            dbg_no_thickness = 0
+            dbg_ok = 0
+            _first_missing: list[int] = []       # up to 5 IDs not found in BDF
+            _first_no_thick: list[str] = []      # up to 5 (eid, prop_type, t_val)
+
             for eid in landing_ids:
                 if eid not in bdf.elements:
+                    dbg_not_in_bdf += 1
+                    if len(_first_missing) < 5:
+                        _first_missing.append(eid)
                     continue
                 elem = bdf.elements[eid]
-                if not (hasattr(elem, "pid") and elem.pid in bdf.properties):
+                if not hasattr(elem, "pid"):
+                    dbg_no_pid += 1
+                    continue
+                if elem.pid not in bdf.properties:
+                    dbg_pid_not_in_props += 1
                     continue
                 prop = bdf.properties[elem.pid]
 
-                thickness = None
-                if hasattr(prop, "t"):                   # PSHELL
-                    thickness = prop.t
-                elif hasattr(prop, "total_thickness"):   # PCOMP
-                    thickness = prop.total_thickness()
+                thickness = _get_thickness(prop, elem)
 
                 if not thickness:
+                    dbg_no_thickness += 1
+                    if len(_first_no_thick) < 5:
+                        raw = getattr(prop, "t", "n/a")
+                        _first_no_thick.append(
+                            f"eid={eid} prop_type={prop.type} prop.t={raw}"
+                        )
                     continue
 
+                dbg_ok += 1
                 zoffset = -thickness / 2.0
                 landing_thickness[eid] = thickness
 
@@ -334,7 +440,11 @@ class BDFOffsetTool:
 
                 # Surface normal (for bar offset direction)
                 if elem.type in ("CQUAD4", "CTRIA3", "CQUAD8", "CTRIA6"):
-                    n_ids = elem.node_ids[:4] if elem.type.startswith("CQUAD") else elem.node_ids[:3]
+                    n_ids = (
+                        elem.node_ids[:4]
+                        if elem.type.startswith("CQUAD")
+                        else elem.node_ids[:3]
+                    )
                     nodes = [bdf.nodes[nid] for nid in n_ids if nid in bdf.nodes]
                     if len(nodes) >= 3:
                         p1 = np.array(nodes[0].xyz)
@@ -345,6 +455,19 @@ class BDFOffsetTool:
                         if norm_len > 1e-10:
                             landing_normals[eid] = normal / norm_len
 
+            # --- Diagnostic report ---
+            self._log(f"\n  Landing element diagnostics:")
+            self._log(f"    IDs from Excel           : {len(landing_ids)}")
+            self._log(f"    Not found in BDF         : {dbg_not_in_bdf}")
+            if _first_missing:
+                self._log(f"      First missing IDs      : {_first_missing}")
+            self._log(f"    No pid attribute         : {dbg_no_pid}")
+            self._log(f"    PID not in properties    : {dbg_pid_not_in_props}")
+            self._log(f"    Zero/None thickness      : {dbg_no_thickness}")
+            if _first_no_thick:
+                for info in _first_no_thick:
+                    self._log(f"      {info}")
+            self._log(f"    Successfully processed   : {dbg_ok}")
             self._log(f"  {len(landing_results)} landing elements processed")
 
             # --- Node-to-shell mapping ---
@@ -362,27 +485,33 @@ class BDFOffsetTool:
             self._log("Calculating bar offsets…")
 
             bar_results = []
-            skipped = 0
+            bar_not_in_bdf = 0
+            bar_no_prop = 0
+            bar_no_thickness = 0
+            bar_no_landing = 0
 
             for eid in bar_ids:
                 if eid not in bdf.elements:
+                    bar_not_in_bdf += 1
                     continue
                 elem = bdf.elements[eid]
                 if elem.type != "CBAR" or not (
                     hasattr(elem, "pid") and elem.pid in bdf.properties
                 ):
+                    bar_no_prop += 1
                     continue
                 prop = bdf.properties[elem.pid]
 
                 bar_t = None
                 if prop.type == "PBARL":
                     if hasattr(prop, "dim") and prop.dim:
-                        bar_t = prop.dim[0]
+                        bar_t = float(prop.dim[0])
                 elif prop.type == "PBAR":
                     if hasattr(prop, "A") and prop.A > 0:
                         bar_t = float(np.sqrt(prop.A))
 
                 if not bar_t:
+                    bar_no_thickness += 1
                     continue
 
                 n1, n2 = elem.node_ids[:2]
@@ -403,7 +532,7 @@ class BDFOffsetTool:
                             best_normal = landing_normals.get(sid)
 
                 if best_normal is None or best_thick == 0:
-                    skipped += 1
+                    bar_no_landing += 1
                     continue
 
                 magnitude = best_thick + bar_t / 2.0
@@ -425,9 +554,14 @@ class BDFOffsetTool:
                     }
                 )
 
+            self._log(f"\n  Bar element diagnostics:")
+            self._log(f"    IDs from Excel           : {len(bar_ids)}")
+            self._log(f"    Not found in BDF         : {bar_not_in_bdf}")
+            self._log(f"    Not CBAR / no property   : {bar_no_prop}")
+            self._log(f"    Zero/None bar thickness  : {bar_no_thickness}")
+            self._log(f"    No landing connection    : {bar_no_landing}")
+            self._log(f"    Successfully processed   : {len(bar_results)}")
             self._log(f"  {len(bar_results)} bar elements processed")
-            if skipped:
-                self._log(f"  {skipped} bars skipped (no landing connection found)")
 
             # --- Write CSV ---
             self._log(f"\n{sep}")
