@@ -571,21 +571,19 @@ class BDFOffsetTool:
                     continue
                 prop = bdf.properties[elem.pid]
 
-                # Read DIM1 and DIM2 separately; which one is used depends on section type
+                # DIM1 is required for all bars (base offset)
+                # DIM2 is only used for C-section extra Y offset
                 bar_dim1 = bar_dim2 = None
                 if prop.type == "PBARL" and hasattr(prop, "dim") and prop.dim:
                     if len(prop.dim) >= 1:
-                        bar_dim1 = float(prop.dim[0])  # DIM1
+                        bar_dim1 = float(prop.dim[0])
                     if len(prop.dim) >= 2:
-                        bar_dim2 = float(prop.dim[1])  # DIM2
+                        bar_dim2 = float(prop.dim[1])
                 elif prop.type == "PBAR":
                     if hasattr(prop, "A") and prop.A > 0:
                         bar_dim1 = bar_dim2 = float(np.sqrt(prop.A))
 
-                section_now = bar_sections.get(eid, "I")
-                # Check required dimension for this section type
-                needed = bar_dim1 if section_now == "I" else bar_dim2
-                if not needed:
+                if not bar_dim1:
                     bar_no_thickness += 1
                     continue
 
@@ -611,26 +609,27 @@ class BDFOffsetTool:
                     continue
 
                 section = section_now
-                y_local, z_local = _bar_local_axes(elem, bdf.nodes)
 
-                if y_local is None:
-                    # No orientation — fall back to landing normal
-                    magnitude = best_thick + (bar_dim1 or 0) / 2.0
-                    offset_vec = -best_normal * magnitude
-                    self._log(
-                        f"  [!] eid={eid} ({section}): no bar orientation "
-                        f"— using landing normal fallback"
-                    )
-                elif section == "I":
-                    # I-section: offset along bar local Z (≈ skin normal)
-                    # magnitude = landing_t + DIM1/2
-                    magnitude = best_thick + bar_dim1 / 2.0
-                    offset_vec = z_local * magnitude
-                else:
-                    # C-section: offset along bar local Y (flange / open side)
-                    # magnitude = DIM2/2  (centroid eccentricity only)
-                    magnitude = bar_dim2 / 2.0
-                    offset_vec = y_local * magnitude
+                # --- Base offset: same as original for every bar ---
+                # direction = -landing_normal
+                # magnitude = landing_t + DIM1/2
+                base_magnitude = best_thick + bar_dim1 / 2.0
+                offset_vec = -best_normal * base_magnitude
+
+                # --- Extra Y offset for C-section only ---
+                # Adds DIM2/2 in bar local Y direction to capture cap geometry.
+                # I-section: extra = 0 (web already centred by base offset)
+                if section == "C" and bar_dim2 is not None:
+                    y_local, _ = _bar_local_axes(elem, bdf.nodes)
+                    if y_local is not None:
+                        offset_vec = offset_vec + y_local * (bar_dim2 / 2.0)
+                    else:
+                        self._log(
+                            f"  [!] eid={eid}: C-section but no bar orientation "
+                            f"— extra Y offset skipped"
+                        )
+
+                magnitude = float(np.linalg.norm(offset_vec))
 
                 bar_results.append(
                     {
