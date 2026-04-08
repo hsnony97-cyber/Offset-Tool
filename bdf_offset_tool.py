@@ -33,7 +33,7 @@ import pandas as pd
 from pyNastran.bdf.bdf import BDF
 
 
-def _get_thickness(prop, elem=None) -> float | None:
+def _get_thickness(prop, elem=None):
     """
     Robustly extract shell thickness from a pyNastran property object.
     Handles PSHELL (prop.t), PCOMP (total_thickness()), and per-element
@@ -319,8 +319,8 @@ class BDFOffsetTool:
                 self._log("  [!] WARNING: No bar sheet detected! "
                           "Sheet must contain 'bar' in its name.")
 
-            landing_ids: list[int] = []
-            bar_ids: list[int] = []
+            landing_ids = []
+            bar_ids = []
 
             if landing_sheet:
                 self._log(f"\n  Reading landing sheet: '{landing_sheet}'…")
@@ -385,8 +385,8 @@ class BDFOffsetTool:
             self._log("Calculating landing offsets…")
 
             landing_results = []
-            landing_thickness: dict[int, float] = {}
-            landing_normals: dict[int, np.ndarray] = {}
+            landing_thickness = {}
+            landing_normals = {}
 
             # Diagnostic counters
             dbg_not_in_bdf = 0
@@ -394,8 +394,8 @@ class BDFOffsetTool:
             dbg_pid_not_in_props = 0
             dbg_no_thickness = 0
             dbg_ok = 0
-            _first_missing: list[int] = []       # up to 5 IDs not found in BDF
-            _first_no_thick: list[str] = []      # up to 5 (eid, prop_type, t_val)
+            _first_missing = []       # up to 5 IDs not found in BDF
+            _first_no_thick = []      # up to 5 (eid, prop_type, t_val)
 
             for eid in landing_ids:
                 if eid not in bdf.elements:
@@ -473,7 +473,7 @@ class BDFOffsetTool:
             # --- Node-to-shell mapping ---
             self._log(f"\n{sep}")
             self._log("Building node-to-shell map…")
-            node_to_shells: dict[int, list[int]] = {}
+            node_to_shells = {}
             for eid, elem in bdf.elements.items():
                 if elem.type in ("CQUAD4", "CTRIA3", "CQUAD8", "CTRIA6"):
                     for nid in elem.node_ids:
@@ -662,8 +662,8 @@ class BDFOffsetTool:
 
             # --- Read CSV ---
             self._log("\nReading offset CSV…")
-            landing_offsets: dict[int, float] = {}
-            bar_offsets: dict[int, tuple] = {}
+            landing_offsets = {}
+            bar_offsets = {}
 
             with open(self.offset_csv_path.get(), "r") as fh:
                 reader = csv.reader(fh)
