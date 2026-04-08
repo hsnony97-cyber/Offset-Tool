@@ -33,7 +33,52 @@ import pandas as pd
 from pyNastran.bdf.bdf import BDF
 
 
-def _get_thickness(prop, elem=None):
+def _bar_local_y(elem, bdf_nodes):
+    """
+    Compute the Nastran CBAR local y-axis unit vector.
+
+    Nastran convention:
+      x_b = unit vector GA -> GB
+      v   = orientation vector (G0 or elem.x field)
+      z_b = normalize( x_b × v )
+      y_b = z_b × x_b
+
+    Returns None if the orientation cannot be determined (degenerate case).
+    """
+    try:
+        ga_xyz = np.array(bdf_nodes[elem.nodes[0]].xyz, dtype=float)
+        gb_xyz = np.array(bdf_nodes[elem.nodes[1]].xyz, dtype=float)
+        x_b = gb_xyz - ga_xyz
+        xnorm = np.linalg.norm(x_b)
+        if xnorm < 1e-10:
+            return None
+        x_b = x_b / xnorm
+
+        # Orientation vector: G0 grid point or explicit vector
+        if elem.g0 is not None:
+            v = np.array(bdf_nodes[elem.g0].xyz, dtype=float) - ga_xyz
+        elif elem.x is not None:
+            v = np.array(elem.x, dtype=float)
+        else:
+            return None
+
+        # z_b = x_b × v  (cross product removes any component along bar)
+        z_b = np.cross(x_b, v)
+        znorm = np.linalg.norm(z_b)
+        if znorm < 1e-10:
+            return None   # orientation vector is parallel to bar axis
+        z_b = z_b / znorm
+
+        # y_b = z_b × x_b
+        y_b = np.cross(z_b, x_b)
+        ynorm = np.linalg.norm(y_b)
+        if ynorm < 1e-10:
+            return None
+        return y_b / ynorm
+    except Exception:
+        return None
+
+
     """
     Robustly extract shell thickness from a pyNastran property object.
     Handles PSHELL (prop.t), PCOMP (total_thickness()), and per-element
@@ -331,14 +376,32 @@ class BDFOffsetTool:
                     sample = landing_ids[:5]
                     self._log(f"    First IDs: {sample}")
 
+            bar_sections = {}   # {eid: 'C' or 'I'}
+
             if bar_sheet:
                 self._log(f"\n  Reading bar sheet: '{bar_sheet}'…")
                 df = pd.read_excel(xl, sheet_name=bar_sheet)
-                bar_ids = df.iloc[:, 0].dropna().astype(int).tolist()
+                df_bar = df.dropna(subset=[df.columns[0]])
+                bar_ids = df_bar.iloc[:, 0].astype(int).tolist()
+
+                # Column B = Section type ('C' or 'I'). Default to 'I' if absent.
+                has_section_col = df_bar.shape[1] > 1
+                for _, row in df_bar.iterrows():
+                    eid = int(row.iloc[0])
+                    if has_section_col and pd.notna(row.iloc[1]):
+                        sec = str(row.iloc[1]).strip().upper()
+                    else:
+                        sec = "I"
+                    bar_sections[eid] = sec
+
+                c_count = sum(1 for s in bar_sections.values() if s == "C")
+                i_count = sum(1 for s in bar_sections.values() if s == "I")
                 self._log(f"    {len(bar_ids)} bar element IDs read from Excel")
+                self._log(f"    Section types — I: {i_count}, C: {c_count}")
+                if not has_section_col:
+                    self._log("    [!] No Section column found — all treated as I-section")
                 if bar_ids:
-                    sample = bar_ids[:5]
-                    self._log(f"    First IDs: {sample}")
+                    self._log(f"    First IDs: {bar_ids[:5]}")
 
             # --- Read BDF ---
             self._log(f"\n{sep}")
@@ -536,7 +599,23 @@ class BDFOffsetTool:
                     continue
 
                 magnitude = best_thick + bar_t / 2.0
-                offset_vec = -best_normal * magnitude
+                section = bar_sections.get(eid, "I")
+
+                if section == "C":
+                    # C-section: offset along bar's local Y axis
+                    y_local = _bar_local_y(elem, bdf.nodes)
+                    if y_local is not None:
+                        offset_vec = y_local * magnitude
+                    else:
+                        # Degenerate orientation — fall back to normal direction
+                        offset_vec = -best_normal * magnitude
+                        self._log(
+                            f"  [!] eid={eid}: C-section but no bar orientation "
+                            f"found — using landing normal as fallback"
+                        )
+                else:
+                    # I-section (default): offset in negative landing normal direction
+                    offset_vec = -best_normal * magnitude
 
                 bar_results.append(
                     {
@@ -544,6 +623,7 @@ class BDFOffsetTool:
                         "Element_Type": elem.type,
                         "Property_ID": elem.pid,
                         "Property_Type": prop.type,
+                        "Section": section,
                         "Bar_Thickness": bar_t,
                         "Connected_Landing_ID": best_landing_id,
                         "Landing_Thickness": best_thick,
@@ -589,13 +669,14 @@ class BDFOffsetTool:
                 writer.writerow(["BAR OFFSETS"])
                 writer.writerow(
                     ["Element_ID", "Element_Type", "Property_ID", "Property_Type",
-                     "Bar_Thickness", "Connected_Landing_ID", "Landing_Thickness",
-                     "Offset_Magnitude", "Offset_X", "Offset_Y", "Offset_Z"]
+                     "Section", "Bar_Thickness", "Connected_Landing_ID",
+                     "Landing_Thickness", "Offset_Magnitude",
+                     "Offset_X", "Offset_Y", "Offset_Z"]
                 )
                 for r in bar_results:
                     writer.writerow(
                         [r["Element_ID"], r["Element_Type"], r["Property_ID"],
-                         r["Property_Type"], r["Bar_Thickness"],
+                         r["Property_Type"], r["Section"], r["Bar_Thickness"],
                          r["Connected_Landing_ID"], r["Landing_Thickness"],
                          r["Offset_Magnitude"], r["Offset_X"],
                          r["Offset_Y"], r["Offset_Z"]]
@@ -687,8 +768,10 @@ class BDFOffsetTool:
                             pass
                     elif section == "bar":
                         try:
+                            # Columns: ID, Type, PID, PropType, Section, BarT,
+                            #          LandingID, LandingT, Magnitude, X, Y, Z
                             bar_offsets[int(row[0])] = (
-                                float(row[8]), float(row[9]), float(row[10])
+                                float(row[9]), float(row[10]), float(row[11])
                             )
                         except (ValueError, IndexError):
                             pass
