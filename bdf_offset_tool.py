@@ -33,17 +33,17 @@ import pandas as pd
 from pyNastran.bdf.bdf import BDF
 
 
-def _bar_local_y(elem, bdf_nodes):
+def _bar_local_axes(elem, bdf_nodes):
     """
-    Compute the Nastran CBAR local y-axis unit vector.
+    Compute the Nastran CBAR local y-axis and z-axis unit vectors.
 
     Nastran convention:
       x_b = unit vector GA -> GB
-      v   = orientation vector (G0 or elem.x field)
+      v   = orientation vector (G0 grid point or elem.x field)
       z_b = normalize( x_b × v )
       y_b = z_b × x_b
 
-    Returns None if the orientation cannot be determined (degenerate case).
+    Returns (y_b, z_b) or (None, None) if orientation is undefined/degenerate.
     """
     try:
         ga_xyz = np.array(bdf_nodes[elem.nodes[0]].xyz, dtype=float)
@@ -51,32 +51,38 @@ def _bar_local_y(elem, bdf_nodes):
         x_b = gb_xyz - ga_xyz
         xnorm = np.linalg.norm(x_b)
         if xnorm < 1e-10:
-            return None
+            return None, None
         x_b = x_b / xnorm
 
-        # Orientation vector: G0 grid point or explicit vector
+        # Orientation vector: G0 grid point or explicit x vector
         if elem.g0 is not None:
             v = np.array(bdf_nodes[elem.g0].xyz, dtype=float) - ga_xyz
         elif elem.x is not None:
             v = np.array(elem.x, dtype=float)
         else:
-            return None
+            return None, None
 
-        # z_b = x_b × v  (cross product removes any component along bar)
+        # z_b = normalize( x_b × v )
         z_b = np.cross(x_b, v)
         znorm = np.linalg.norm(z_b)
         if znorm < 1e-10:
-            return None   # orientation vector is parallel to bar axis
+            return None, None   # orientation vector parallel to bar axis
         z_b = z_b / znorm
 
         # y_b = z_b × x_b
         y_b = np.cross(z_b, x_b)
         ynorm = np.linalg.norm(y_b)
         if ynorm < 1e-10:
-            return None
-        return y_b / ynorm
+            return None, None
+        return y_b / ynorm, z_b
     except Exception:
-        return None
+        return None, None
+
+
+# Keep old name as thin wrapper for any legacy call sites
+def _bar_local_y(elem, bdf_nodes):
+    y, _ = _bar_local_axes(elem, bdf_nodes)
+    return y
 
 
     """
@@ -565,18 +571,21 @@ class BDFOffsetTool:
                     continue
                 prop = bdf.properties[elem.pid]
 
-                bar_t = None
-                if prop.type == "PBARL":
-                    # DIM2 (index 1) = section height used for Y-offset
-                    if hasattr(prop, "dim") and len(prop.dim) > 1:
-                        bar_t = float(prop.dim[1])
-                    elif hasattr(prop, "dim") and prop.dim:
-                        bar_t = float(prop.dim[0])  # fallback to DIM1
+                # Read DIM1 and DIM2 separately; which one is used depends on section type
+                bar_dim1 = bar_dim2 = None
+                if prop.type == "PBARL" and hasattr(prop, "dim") and prop.dim:
+                    if len(prop.dim) >= 1:
+                        bar_dim1 = float(prop.dim[0])  # DIM1
+                    if len(prop.dim) >= 2:
+                        bar_dim2 = float(prop.dim[1])  # DIM2
                 elif prop.type == "PBAR":
                     if hasattr(prop, "A") and prop.A > 0:
-                        bar_t = float(np.sqrt(prop.A))
+                        bar_dim1 = bar_dim2 = float(np.sqrt(prop.A))
 
-                if not bar_t:
+                section_now = bar_sections.get(eid, "I")
+                # Check required dimension for this section type
+                needed = bar_dim1 if section_now == "I" else bar_dim2
+                if not needed:
                     bar_no_thickness += 1
                     continue
 
@@ -601,28 +610,26 @@ class BDFOffsetTool:
                     bar_no_landing += 1
                     continue
 
-                section = bar_sections.get(eid, "I")
-                y_local = _bar_local_y(elem, bdf.nodes)
+                section = section_now
+                y_local, z_local = _bar_local_axes(elem, bdf.nodes)
 
                 if y_local is None:
-                    # No orientation defined — fall back to landing normal for both types
-                    magnitude = best_thick / 2.0 + bar_t / 2.0
+                    # No orientation — fall back to landing normal
+                    magnitude = best_thick + (bar_dim1 or 0) / 2.0
                     offset_vec = -best_normal * magnitude
                     self._log(
                         f"  [!] eid={eid} ({section}): no bar orientation "
                         f"— using landing normal fallback"
                     )
                 elif section == "I":
-                    # I-beam: bottom flange (cap) at shell outer surface,
-                    # neutral axis at bar_height/2 above it.
-                    # offset = landing_t/2 (to shell outer surface)
-                    #        + bar_dim2/2 (to neutral axis / web centre)
-                    magnitude = best_thick / 2.0 + bar_t / 2.0
-                    offset_vec = y_local * magnitude
+                    # I-section: offset along bar local Z (≈ skin normal)
+                    # magnitude = landing_t + DIM1/2
+                    magnitude = best_thick + bar_dim1 / 2.0
+                    offset_vec = z_local * magnitude
                 else:
-                    # C-section: web face sits at shell outer surface.
-                    # offset = landing_t/2 only (neutral axis at web junction).
-                    magnitude = best_thick / 2.0
+                    # C-section: offset along bar local Y (flange / open side)
+                    # magnitude = DIM2/2  (centroid eccentricity only)
+                    magnitude = bar_dim2 / 2.0
                     offset_vec = y_local * magnitude
 
                 bar_results.append(
