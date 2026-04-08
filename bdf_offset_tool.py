@@ -567,8 +567,11 @@ class BDFOffsetTool:
 
                 bar_t = None
                 if prop.type == "PBARL":
-                    if hasattr(prop, "dim") and prop.dim:
-                        bar_t = float(prop.dim[0])
+                    # DIM2 (index 1) = section height used for Y-offset
+                    if hasattr(prop, "dim") and len(prop.dim) > 1:
+                        bar_t = float(prop.dim[1])
+                    elif hasattr(prop, "dim") and prop.dim:
+                        bar_t = float(prop.dim[0])  # fallback to DIM1
                 elif prop.type == "PBAR":
                     if hasattr(prop, "A") and prop.A > 0:
                         bar_t = float(np.sqrt(prop.A))
@@ -598,24 +601,29 @@ class BDFOffsetTool:
                     bar_no_landing += 1
                     continue
 
-                magnitude = best_thick + bar_t / 2.0
                 section = bar_sections.get(eid, "I")
+                y_local = _bar_local_y(elem, bdf.nodes)
 
-                if section == "C":
-                    # C-section: offset along bar's local Y axis
-                    y_local = _bar_local_y(elem, bdf.nodes)
-                    if y_local is not None:
-                        offset_vec = y_local * magnitude
-                    else:
-                        # Degenerate orientation — fall back to normal direction
-                        offset_vec = -best_normal * magnitude
-                        self._log(
-                            f"  [!] eid={eid}: C-section but no bar orientation "
-                            f"found — using landing normal as fallback"
-                        )
-                else:
-                    # I-section (default): offset in negative landing normal direction
+                if y_local is None:
+                    # No orientation defined — fall back to landing normal for both types
+                    magnitude = best_thick / 2.0 + bar_t / 2.0
                     offset_vec = -best_normal * magnitude
+                    self._log(
+                        f"  [!] eid={eid} ({section}): no bar orientation "
+                        f"— using landing normal fallback"
+                    )
+                elif section == "I":
+                    # I-beam: bottom flange (cap) at shell outer surface,
+                    # neutral axis at bar_height/2 above it.
+                    # offset = landing_t/2 (to shell outer surface)
+                    #        + bar_dim2/2 (to neutral axis / web centre)
+                    magnitude = best_thick / 2.0 + bar_t / 2.0
+                    offset_vec = y_local * magnitude
+                else:
+                    # C-section: web face sits at shell outer surface.
+                    # offset = landing_t/2 only (neutral axis at web junction).
+                    magnitude = best_thick / 2.0
+                    offset_vec = y_local * magnitude
 
                 bar_results.append(
                     {
