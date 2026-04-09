@@ -608,7 +608,7 @@ class BDFOffsetTool:
                     bar_no_landing += 1
                     continue
 
-                section = section_now
+                section = bar_sections.get(eid, "I")
 
                 # --- Base offset (original, same for all bars) ---
                 # direction = -landing_normal
