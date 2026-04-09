@@ -382,7 +382,8 @@ class BDFOffsetTool:
                     sample = landing_ids[:5]
                     self._log(f"    First IDs: {sample}")
 
-            bar_sections = {}   # {eid: 'C' or 'I'}
+            bar_sections = {}    # {eid: 'C' or 'I'}
+            bar_y_signs  = {}    # {eid: +1 or -1}  — C-section only
 
             if bar_sheet:
                 self._log(f"\n  Reading bar sheet: '{bar_sheet}'…")
@@ -390,22 +391,38 @@ class BDFOffsetTool:
                 df_bar = df.dropna(subset=[df.columns[0]])
                 bar_ids = df_bar.iloc[:, 0].astype(int).tolist()
 
-                # Column B = Section type ('C' or 'I'). Default to 'I' if absent.
-                has_section_col = df_bar.shape[1] > 1
+                has_section_col  = df_bar.shape[1] > 1
+                has_sign_col     = df_bar.shape[1] > 2   # Column C
+
                 for _, row in df_bar.iterrows():
                     eid = int(row.iloc[0])
+
+                    # Column B — Section type
                     if has_section_col and pd.notna(row.iloc[1]):
                         sec = str(row.iloc[1]).strip().upper()
                     else:
                         sec = "I"
                     bar_sections[eid] = sec
 
-                c_count = sum(1 for s in bar_sections.values() if s == "C")
-                i_count = sum(1 for s in bar_sections.values() if s == "I")
+                    # Column C — Offset Y Location (Positive / Negative)
+                    sign = 1
+                    if has_sign_col and pd.notna(row.iloc[2]):
+                        val = str(row.iloc[2]).strip().lower()
+                        if "neg" in val:
+                            sign = -1
+                    bar_y_signs[eid] = sign
+
+                c_count  = sum(1 for s in bar_sections.values() if s == "C")
+                i_count  = sum(1 for s in bar_sections.values() if s == "I")
+                c_neg    = sum(1 for e, s in bar_sections.items()
+                               if s == "C" and bar_y_signs.get(e, 1) == -1)
                 self._log(f"    {len(bar_ids)} bar element IDs read from Excel")
-                self._log(f"    Section types — I: {i_count}, C: {c_count}")
+                self._log(f"    Section types — I: {i_count},  C: {c_count} "
+                          f"(C positive: {c_count - c_neg},  C negative: {c_neg})")
                 if not has_section_col:
-                    self._log("    [!] No Section column found — all treated as I-section")
+                    self._log("    [!] No Section column — all treated as I-section")
+                if not has_sign_col:
+                    self._log("    [!] No Sign column — all C-sections treated as Positive")
                 if bar_ids:
                     self._log(f"    First IDs: {bar_ids[:5]}")
 
@@ -456,6 +473,7 @@ class BDFOffsetTool:
             landing_results = []
             landing_thickness = {}
             landing_normals = {}
+            landing_centroids = {}  # {eid: centroid_xyz}
 
             # Diagnostic counters
             dbg_not_in_bdf = 0
@@ -507,7 +525,7 @@ class BDFOffsetTool:
                     }
                 )
 
-                # Surface normal (for bar offset direction)
+                # Surface normal and centroid (for bar offset direction/selection)
                 if elem.type in ("CQUAD4", "CTRIA3", "CQUAD8", "CTRIA6"):
                     n_ids = (
                         elem.node_ids[:4]
@@ -523,6 +541,9 @@ class BDFOffsetTool:
                         norm_len = np.linalg.norm(normal)
                         if norm_len > 1e-10:
                             landing_normals[eid] = normal / norm_len
+                    if nodes:
+                        pts = np.array([n.xyz for n in nodes])
+                        landing_centroids[eid] = pts.mean(axis=0)
 
             # --- Diagnostic report ---
             self._log(f"\n  Landing element diagnostics:")
@@ -592,23 +613,99 @@ class BDFOffsetTool:
                 shells_n2 = set(node_to_shells.get(n2, []))
                 connected = shells_n1 & shells_n2
 
-                # Pick connected landing shell with greatest thickness
+                section = bar_sections.get(eid, "I")
+                sign = bar_y_signs.get(eid, 1)
+
+                # For C-section: pick the landing shell on the side the bar
+                # offsets toward (y_perp * sign direction from bar midpoint).
+                # For I-section: pick the thickest connected landing shell.
                 best_thick = 0.0
                 best_normal = None
                 best_landing_id = None
-                for sid in connected:
-                    if sid in landing_thickness:
-                        t = landing_thickness[sid]
-                        if t > best_thick:
-                            best_thick = t
-                            best_landing_id = sid
-                            best_normal = landing_normals.get(sid)
+
+                if section == "C":
+                    # Compute bar local Y first so we know the offset direction
+                    y_local_c, _ = _bar_local_axes(elem, bdf.nodes)
+                    # Bar midpoint for projection reference
+                    ga_xyz = np.array(bdf.nodes[n1].xyz) if n1 in bdf.nodes else None
+                    gb_xyz = np.array(bdf.nodes[n2].xyz) if n2 in bdf.nodes else None
+                    bar_mid = (
+                        (ga_xyz + gb_xyz) / 2.0
+                        if ga_xyz is not None and gb_xyz is not None
+                        else None
+                    )
+
+                    # We need a reference normal to project y_local.
+                    # Use the thickest connected landing normal as a proxy.
+                    ref_normal = None
+                    ref_thick = 0.0
+                    for sid in connected:
+                        if sid in landing_thickness:
+                            t = landing_thickness[sid]
+                            if t > ref_thick:
+                                ref_thick = t
+                                ref_normal = landing_normals.get(sid)
+
+                    if (
+                        y_local_c is not None
+                        and ref_normal is not None
+                        and bar_mid is not None
+                    ):
+                        # Direction the C flange will extend toward
+                        y_perp_dir = (
+                            y_local_c
+                            - np.dot(y_local_c, ref_normal) * ref_normal
+                        )
+                        y_perp_norm = np.linalg.norm(y_perp_dir)
+                        if y_perp_norm > 1e-10:
+                            y_perp_dir = y_perp_dir / y_perp_norm
+                            offset_dir = y_perp_dir * sign
+                            # Pick the connected landing whose centroid is
+                            # most in the offset direction from the bar mid.
+                            best_proj = None
+                            for sid in connected:
+                                if sid not in landing_thickness:
+                                    continue
+                                centroid = landing_centroids.get(sid)
+                                if centroid is None:
+                                    continue
+                                proj = float(
+                                    np.dot(centroid - bar_mid, offset_dir)
+                                )
+                                if best_proj is None or proj > best_proj:
+                                    best_proj = proj
+                                    best_landing_id = sid
+                                    best_thick = landing_thickness[sid]
+                                    best_normal = landing_normals.get(sid)
+                        # fallback: use thickest if direction selection fails
+                        if best_normal is None:
+                            best_thick = ref_thick
+                            best_normal = ref_normal
+                            for sid in connected:
+                                if landing_thickness.get(sid, 0) == ref_thick:
+                                    best_landing_id = sid
+                                    break
+                    else:
+                        # No orientation info — fall back to thickest
+                        best_thick = ref_thick
+                        best_normal = ref_normal
+                        for sid in connected:
+                            if landing_thickness.get(sid, 0) == ref_thick:
+                                best_landing_id = sid
+                                break
+                else:
+                    # I-section: pick thickest connected landing shell
+                    for sid in connected:
+                        if sid in landing_thickness:
+                            t = landing_thickness[sid]
+                            if t > best_thick:
+                                best_thick = t
+                                best_landing_id = sid
+                                best_normal = landing_normals.get(sid)
 
                 if best_normal is None or best_thick == 0:
                     bar_no_landing += 1
                     continue
-
-                section = bar_sections.get(eid, "I")
 
                 # --- Base offset (original, same for all bars) ---
                 # direction = -landing_normal
@@ -619,7 +716,7 @@ class BDFOffsetTool:
                 # --- Extra offset for C-section only ---
                 # Take bar local Y, remove its component along the landing normal
                 # (keep only the part perpendicular to the normal), then add
-                # that direction * DIM2/2 to the base offset.
+                # that direction * DIM2/2 * sign to the base offset.
                 # I-section: no extra needed (web is already centred).
                 if section == "C" and bar_dim2 is not None:
                     y_local, _ = _bar_local_axes(elem, bdf.nodes)
@@ -629,7 +726,7 @@ class BDFOffsetTool:
                         y_perp_norm = np.linalg.norm(y_perp)
                         if y_perp_norm > 1e-10:
                             y_perp = y_perp / y_perp_norm
-                            offset_vec = offset_vec + y_perp * (bar_dim2 / 2.0)
+                            offset_vec = offset_vec + y_perp * (bar_dim2 / 2.0) * sign
                         else:
                             self._log(
                                 f"  [!] eid={eid}: bar Y is parallel to normal "
