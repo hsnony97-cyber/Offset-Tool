@@ -650,7 +650,7 @@ class BDFOffsetTool:
                         "Property_ID": elem.pid,
                         "Property_Type": prop.type,
                         "Section": section,
-                        "Bar_Thickness": bar_t,
+                        "Bar_Thickness": bar_dim1,
                         "Connected_Landing_ID": best_landing_id,
                         "Landing_Thickness": best_thick,
                         "Offset_Magnitude": magnitude,
