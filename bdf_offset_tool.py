@@ -610,23 +610,35 @@ class BDFOffsetTool:
 
                 section = section_now
 
-                # --- Base offset: same as original for every bar ---
+                # --- Base offset (original, same for all bars) ---
                 # direction = -landing_normal
                 # magnitude = landing_t + DIM1/2
                 base_magnitude = best_thick + bar_dim1 / 2.0
                 offset_vec = -best_normal * base_magnitude
 
-                # --- Extra Y offset for C-section only ---
-                # Adds DIM2/2 in bar local Y direction to capture cap geometry.
-                # I-section: extra = 0 (web already centred by base offset)
+                # --- Extra offset for C-section only ---
+                # Take bar local Y, remove its component along the landing normal
+                # (keep only the part perpendicular to the normal), then add
+                # that direction * DIM2/2 to the base offset.
+                # I-section: no extra needed (web is already centred).
                 if section == "C" and bar_dim2 is not None:
                     y_local, _ = _bar_local_axes(elem, bdf.nodes)
                     if y_local is not None:
-                        offset_vec = offset_vec + y_local * (bar_dim2 / 2.0)
+                        # Project bar_local_y onto the plane perpendicular to normal
+                        y_perp = y_local - np.dot(y_local, best_normal) * best_normal
+                        y_perp_norm = np.linalg.norm(y_perp)
+                        if y_perp_norm > 1e-10:
+                            y_perp = y_perp / y_perp_norm
+                            offset_vec = offset_vec + y_perp * (bar_dim2 / 2.0)
+                        else:
+                            self._log(
+                                f"  [!] eid={eid}: bar Y is parallel to normal "
+                                f"— C extra offset skipped"
+                            )
                     else:
                         self._log(
-                            f"  [!] eid={eid}: C-section but no bar orientation "
-                            f"— extra Y offset skipped"
+                            f"  [!] eid={eid}: no bar orientation "
+                            f"— C extra offset skipped"
                         )
 
                 magnitude = float(np.linalg.norm(offset_vec))
